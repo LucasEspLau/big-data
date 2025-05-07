@@ -1,0 +1,139 @@
+Description: Stack Firehose
+
+Parameters:
+  pNameBucket:
+    Description: Nombre bucket
+    Type: String
+    Default: aws-firehose
+
+Resources:
+
+  # Creación de recurso en Kinesis Data Firehose que tendrá como salida un bucket de S3
+  rFirehose:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamName: StreamSensorIoT
+      ExtendedS3DestinationConfiguration:
+        BucketARN: !Join 
+          - ''
+          - - 'arn:aws:s3:::'
+            - !Ref rS3Bucket
+        BufferingHints:
+          IntervalInSeconds: '60'
+          SizeInMBs: '1'
+        CompressionFormat: UNCOMPRESSED
+        Prefix: data/input/firehose/sensor/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/hour=!{timestamp:HH}
+        ErrorOutputPrefix: data/input/firehose/error
+        RoleARN: !GetAtt rRole.Arn
+
+  # Creación de un bucket en S3 donde se almacenarán los mensajes enviados desde Kinesis Data Firehose
+  rS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Join [ '-', [ !Ref pNameBucket, !Ref AWS::AccountId ] ]
+
+  # Creación de rol en IAM que se asociará al recurso de Kinesis Data Firehose para que le brinde permiso de crear archivos en un bucket de S3
+  rRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: firehose_delivery_policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:AbortMultipartUpload'
+                  - 's3:GetBucketLocation'
+                  - 's3:GetObject'
+                  - 's3:ListBucket'
+                  - 's3:ListBucketMultipartUploads'
+                  - 's3:PutObject'
+                Resource:
+                  - !Join 
+                    - ''
+                    - - 'arn:aws:s3:::'
+                      - !Ref rS3Bucket
+                  - !Join 
+                    - ''
+                    - - 'arn:aws:s3:::'
+                      - !Ref rS3Bucket
+                      - '*'
+
+  # Creación de la función Lambda que procesará los datos recibidos del API Gateway
+  rLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: ProcessSensorData
+      Handler: index.handler
+      Role: !GetAtt rLambdaRole.Arn
+      Code:
+        S3Bucket: aws-firehose-lambda-code-315089529382  # Usar el nombre del bucket existente
+        S3Key: index.zip  # Asegúrate de cargar tu código Python comprimido en S3.
+      Runtime: python3.8  # O el runtime de tu preferencia
+
+  # Creación del rol Lambda que permitirá a la función Lambda acceder a Kinesis Firehose
+  rLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: LambdaFirehosePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - firehose:PutRecord
+                  - firehose:PutRecordBatch
+                Resource: !GetAtt rFirehose.Arn
+
+  # Creación del API Gateway para exponer la Lambda a los dispositivos IoT
+  rApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: SensorDataApi
+      Description: API para recibir datos del sensor
+      FailOnWarnings: true
+
+  # Creación de un recurso dentro del API Gateway para recibir los datos del sensor
+  rApiResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt rApiGateway.RootResourceId
+      RestApiId: !Ref rApiGateway
+      PathPart: sensor
+
+  # Creación del método POST dentro del recurso para que los dispositivos IoT puedan enviar datos
+  rApiMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: POST
+      ResourceId: !Ref rApiResource
+      RestApiId: !Ref rApiGateway
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${rLambdaFunction.Arn}/invocations"
+
+Outputs:
+  ApiUrl:
+    Value: !Sub "https://${rApiGateway}.execute-api.${AWS::Region}.amazonaws.com/prod/sensor"
+    Description: "URL de la API para los datos del sensor"
+  LambdaFunctionName:
+    Value: !Ref rLambdaFunction
+    Description: "Nombre de la función Lambda"
